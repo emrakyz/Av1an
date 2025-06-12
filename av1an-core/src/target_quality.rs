@@ -1,16 +1,13 @@
-#[cfg(test)]
-mod tests;
-
 use std::{
     cmp,
     cmp::Ordering,
+    collections::HashSet,
     convert::TryInto,
-    fmt::Error,
-    path::{Path, PathBuf},
-    process::Stdio,
+    path::PathBuf,
     thread::available_parallelism,
 };
 
+use clap::ValueEnum;
 use ffmpeg::format::Pixel;
 use serde::{Deserialize, Serialize};
 use splines::{Interpolation, Key, Spline};
@@ -20,32 +17,49 @@ use crate::{
     broker::EncoderCrash,
     chunk::Chunk,
     progress_bar::update_mp_msg,
-    vmaf::{self, read_weighted_vmaf},
+    settings::ProbingStats,
+    vmaf::{read_weighted_vmaf, VmafScoreMethod},
     Encoder,
+    ProbingSpeed,
 };
 
-const VMAF_PERCENTILE: f64 = 0.01;
+const SCORE_TOLERANCE: f64 = 0.01;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetQuality {
-    pub vmaf_res:      String,
-    pub vmaf_scaler:   String,
-    pub vmaf_filter:   Option<String>,
-    pub vmaf_threads:  usize,
-    pub model:         Option<PathBuf>,
-    pub probing_rate:  usize,
-    pub probing_speed: Option<u8>,
-    pub probes:        u32,
-    pub target:        f64,
-    pub min_q:         u32,
-    pub max_q:         u32,
-    pub encoder:       Encoder,
-    pub pix_format:    Pixel,
-    pub temp:          String,
-    pub workers:       usize,
-    pub video_params:  Vec<String>,
-    pub vspipe_args:   Vec<String>,
-    pub probe_slow:    bool,
+    pub vmaf_res:              String,
+    pub vmaf_scaler:           String,
+    pub vmaf_filter:           Option<String>,
+    pub vmaf_threads:          usize,
+    pub model:                 Option<PathBuf>,
+    pub probing_rate:          usize,
+    pub probing_speed:         Option<u8>,
+    pub probes:                u32,
+    pub target:                f64,
+    pub min_q:                 u32,
+    pub max_q:                 u32,
+    pub encoder:               Encoder,
+    pub pix_format:            Pixel,
+    pub temp:                  String,
+    pub workers:               usize,
+    pub video_params:          Vec<String>,
+    pub vspipe_args:           Vec<String>,
+    pub probe_slow:            bool,
+    pub probing_vmaf_features: Vec<VmafFeature>,
+    pub probing_stats:         Option<ProbingStats>,
+    pub probing_percent:       Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+pub enum VmafFeature {
+    #[value(name = "default")]
+    Default,
+    #[value(name = "weighted")]
+    Weighted,
+    #[value(name = "neg")]
+    Neg,
+    #[value(name = "motionless")]
+    Motionless,
 }
 
 impl TargetQuality {
@@ -53,118 +67,142 @@ impl TargetQuality {
         &self,
         chunk: &Chunk,
         worker_id: Option<usize>,
-    ) -> Result<u32, Box<EncoderCrash>> {
-        let mut vmaf_cq = vec![];
-        let frames = chunk.frames();
-
-        // Make middle probe
-        let middle_point = (self.min_q + self.max_q) / 2;
-        let last_q = middle_point;
+    ) -> anyhow::Result<u32> {
+        // History of probe results as quantizer-score pairs
+        let mut quantizer_score_history: Vec<(u32, f64)> = vec![];
 
         let update_progress_bar = |last_q: u32| {
             if let Some(worker_id) = worker_id {
                 update_mp_msg(
                     worker_id,
-                    format!("Targeting Quality {} - Testing {}", self.target, last_q),
+                    format!(
+                        "Targeting Quality {target} - Testing {last_q}",
+                        target = self.target
+                    ),
                 );
             }
         };
 
-        update_progress_bar(last_q);
+        // Initialize quantizer limits from specified minimum and maximum quantizers
+        let mut lower_quantizer_limit = self.min_q;
+        let mut upper_quantizer_limit = self.max_q;
 
-        let mut score =
-            read_weighted_vmaf(self.vmaf_probe(chunk, last_q as usize)?, VMAF_PERCENTILE).unwrap();
-        vmaf_cq.push((score, last_q));
-
-        // Initialize search boundary
-        let mut vmaf_lower = score;
-        let mut vmaf_upper = score;
-        let mut vmaf_cq_lower = last_q;
-        let mut vmaf_cq_upper = last_q;
-
-        // Branch
-        let next_q = if score < self.target {
-            self.min_q
+        let score_method = if let Some(percent) = self.probing_percent {
+            VmafScoreMethod::Percentile(percent)
+        } else if let Some(stats) = self.probing_stats {
+            match stats {
+                ProbingStats::Mean => VmafScoreMethod::Mean,
+                ProbingStats::Median => VmafScoreMethod::Median,
+                ProbingStats::HarmonicMean => VmafScoreMethod::HarmonicMean,
+            }
         } else {
-            self.max_q
+            VmafScoreMethod::Percentile(0.01)
         };
-        update_progress_bar(next_q);
 
-        // Edge case check
-        score =
-            read_weighted_vmaf(self.vmaf_probe(chunk, next_q as usize)?, VMAF_PERCENTILE).unwrap();
-        vmaf_cq.push((score, next_q));
-
-        if (next_q == self.min_q && score < self.target)
-            || (next_q == self.max_q && score > self.target)
-        {
-            log_probes(
-                &mut vmaf_cq,
-                frames as u32,
-                self.probing_rate as u32,
-                &chunk.name(),
-                next_q,
-                score,
-                if score < self.target {
-                    Skip::Low
-                } else {
-                    Skip::High
-                },
-            );
-            return Ok(next_q);
-        }
-
-        // Set boundary
-        if score < self.target {
-            vmaf_lower = score;
-            vmaf_cq_lower = next_q;
-        } else {
-            vmaf_upper = score;
-            vmaf_cq_upper = next_q;
-        }
-
-        // VMAF search
-        for _ in 0..self.probes - 2 {
-            let new_point = weighted_search(
-                f64::from(vmaf_cq_lower),
-                vmaf_lower,
-                f64::from(vmaf_cq_upper),
-                vmaf_upper,
+        loop {
+            let next_quantizer = predict_quantizer(
+                lower_quantizer_limit,
+                upper_quantizer_limit,
+                &quantizer_score_history,
                 self.target,
             );
 
-            if vmaf_cq.iter().map(|(_, x)| *x).any(|x| x == new_point as u32) {
+            if quantizer_score_history
+                .iter()
+                .any(|(quantizer, _)| *quantizer == next_quantizer)
+            {
+                // Predicted quantizer has already been probed
+                let (last_quantizer, last_score) = quantizer_score_history
+                    .iter()
+                    .find(|(quantizer, _)| *quantizer == next_quantizer)
+                    .unwrap();
+                log_probes(
+                    &mut quantizer_score_history.clone(),
+                    self.target,
+                    chunk.frames() as u32,
+                    self.probing_rate as u32,
+                    self.probing_speed,
+                    &chunk.name(),
+                    *last_quantizer,
+                    *last_score,
+                    SkipProbingReason::None,
+                );
                 break;
             }
 
-            update_progress_bar(new_point as u32);
+            update_progress_bar(next_quantizer);
 
-            score =
-                read_weighted_vmaf(self.vmaf_probe(chunk, new_point)?, VMAF_PERCENTILE).unwrap();
-            vmaf_cq.push((score, new_point as u32));
+            let probe_path = self.vmaf_probe(chunk, next_quantizer as usize)?;
+            let score = read_weighted_vmaf(&probe_path, score_method)?;
+            let score_within_tolerance = within_tolerance(score, self.target);
 
-            // Update boundary
-            if score < self.target {
-                vmaf_lower = score;
-                vmaf_cq_lower = new_point as u32;
+            quantizer_score_history.push((next_quantizer, score));
+
+            if score_within_tolerance || quantizer_score_history.len() >= self.probes as usize {
+                log_probes(
+                    &mut quantizer_score_history,
+                    self.target,
+                    chunk.frames() as u32,
+                    self.probing_rate as u32,
+                    self.probing_speed,
+                    &chunk.name(),
+                    next_quantizer,
+                    score,
+                    if score_within_tolerance {
+                        SkipProbingReason::WithinTolerance
+                    } else {
+                        SkipProbingReason::ProbeLimitReached
+                    },
+                );
+                break;
+            }
+
+            if score > self.target {
+                lower_quantizer_limit = (next_quantizer + 1).min(upper_quantizer_limit);
             } else {
-                vmaf_upper = score;
-                vmaf_cq_upper = new_point as u32;
+                upper_quantizer_limit = (next_quantizer - 1).max(lower_quantizer_limit);
+            }
+
+            // Ensure quantizer limits are valid
+            if lower_quantizer_limit > upper_quantizer_limit {
+                log_probes(
+                    &mut quantizer_score_history,
+                    self.target,
+                    chunk.frames() as u32,
+                    self.probing_rate as u32,
+                    self.probing_speed,
+                    &chunk.name(),
+                    next_quantizer,
+                    score,
+                    if score > self.target {
+                        SkipProbingReason::QuantizerTooHigh
+                    } else {
+                        SkipProbingReason::QuantizerTooLow
+                    },
+                );
+                break;
             }
         }
 
-        let (q, q_vmaf) = interpolated_target_q(vmaf_cq.clone(), self.target);
-        log_probes(
-            &mut vmaf_cq,
-            frames as u32,
-            self.probing_rate as u32,
-            &chunk.name(),
-            q as u32,
-            q_vmaf,
-            Skip::None,
-        );
+        let history_within_tolerance: Vec<&(u32, f64)> = quantizer_score_history
+            .iter()
+            .filter(|(_, score)| within_tolerance(*score, self.target))
+            .collect();
 
-        Ok(q as u32)
+        let final_quantizer_score = if !history_within_tolerance.is_empty() {
+            history_within_tolerance.iter().max_by_key(|(quantizer, _)| *quantizer).unwrap()
+        } else {
+            quantizer_score_history
+                .iter()
+                .min_by(|(_, score1), (_, score2)| {
+                    let difference1 = (score1 - self.target).abs();
+                    let difference2 = (score2 - self.target).abs();
+                    difference1.partial_cmp(&difference2).unwrap_or(Ordering::Equal)
+                })
+                .unwrap()
+        };
+
+        Ok(final_quantizer_score.0)
     }
 
     fn vmaf_probe(&self, chunk: &Chunk, q: usize) -> Result<PathBuf, Box<EncoderCrash>> {
@@ -191,28 +229,29 @@ impl TargetQuality {
                 tokio::process::Command::new(pipe_cmd)
                     .args(args)
                     .stderr(if cfg!(windows) {
-                        Stdio::null()
+                        std::process::Stdio::null()
                     } else {
-                        Stdio::piped()
+                        std::process::Stdio::piped()
                     })
-                    .stdout(Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap()
             } else {
                 unreachable!()
             };
 
-            let source_pipe_stdout: Stdio = source.stdout.take().unwrap().try_into().unwrap();
+            let source_pipe_stdout: std::process::Stdio =
+                source.stdout.take().unwrap().try_into().unwrap();
 
             let mut source_pipe = if let [ffmpeg, args @ ..] = &*cmd.0 {
                 tokio::process::Command::new(ffmpeg)
                     .args(args)
                     .stdin(source_pipe_stdout)
-                    .stdout(Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
                     .stderr(if cfg!(windows) {
-                        Stdio::null()
+                        std::process::Stdio::null()
                     } else {
-                        Stdio::piped()
+                        std::process::Stdio::piped()
                     })
                     .spawn()
                     .unwrap()
@@ -220,17 +259,18 @@ impl TargetQuality {
                 unreachable!()
             };
 
-            let source_pipe_stdout: Stdio = source_pipe.stdout.take().unwrap().try_into().unwrap();
+            let source_pipe_stdout: std::process::Stdio =
+                source_pipe.stdout.take().unwrap().try_into().unwrap();
 
             let enc_pipe = if let [cmd, args @ ..] = &*cmd.1 {
                 tokio::process::Command::new(cmd.as_ref())
                     .args(args.iter().map(AsRef::as_ref))
                     .stdin(source_pipe_stdout)
-                    .stdout(Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
                     .stderr(if cfg!(windows) {
-                        Stdio::null()
+                        std::process::Stdio::null()
                     } else {
-                        Stdio::piped()
+                        std::process::Stdio::piped()
                     })
                     .spawn()
                     .unwrap()
@@ -259,25 +299,73 @@ impl TargetQuality {
         };
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
-
         rt.block_on(future)?;
 
-        let probe_name =
-            Path::new(&chunk.temp).join("split").join(format!("v_{q}_{}.ivf", chunk.index));
-        let fl_path = Path::new(&chunk.temp).join("split").join(format!("{}.json", chunk.index));
+        let extension = match self.encoder {
+            crate::encoder::Encoder::x264 => "264",
+            crate::encoder::Encoder::x265 => "hevc",
+            _ => "ivf",
+        };
 
-        vmaf::run_vmaf(
-            &probe_name,
-            chunk.source_cmd.as_slice(),
-            self.vspipe_args.clone(),
-            &fl_path,
-            self.model.as_ref(),
-            &self.vmaf_res,
-            &self.vmaf_scaler,
-            self.probing_rate,
-            self.vmaf_filter.as_deref(),
-            self.vmaf_threads,
-        )?;
+        let probe_name = std::path::Path::new(&chunk.temp)
+            .join("split")
+            .join(format!("v_{index:05}_{q}.{extension}", index = chunk.index));
+        let fl_path = std::path::Path::new(&chunk.temp)
+            .join("split")
+            .join(format!("{index}.json", index = chunk.index));
+
+        let features: HashSet<_> = self.probing_vmaf_features.iter().copied().collect();
+        let use_weighted = features.contains(&VmafFeature::Weighted);
+        let use_neg = features.contains(&VmafFeature::Neg);
+        let disable_motion = features.contains(&VmafFeature::Motionless);
+
+        let default_neg_model = PathBuf::from("vmaf_v0.6.1neg.json");
+        let model = if use_neg && self.model.is_none() {
+            Some(&default_neg_model)
+        } else {
+            self.model.as_ref()
+        };
+
+        if use_weighted {
+            crate::vmaf::run_vmaf_weighted(
+                &probe_name,
+                chunk.source_cmd.as_slice(),
+                self.vspipe_args.clone(),
+                &fl_path,
+                model,
+                &self.vmaf_res,
+                &self.vmaf_scaler,
+                self.probing_rate,
+                self.vmaf_filter.as_deref(),
+                self.vmaf_threads,
+                chunk.frame_rate,
+                disable_motion,
+            )
+            .map_err(|e| {
+                Box::new(EncoderCrash {
+                    exit_status:        std::process::ExitStatus::default(),
+                    source_pipe_stderr: String::new().into(),
+                    ffmpeg_pipe_stderr: None,
+                    stderr:             format!("VMAF calculation failed: {e}").into(),
+                    stdout:             String::new().into(),
+                })
+            })?;
+        } else {
+            crate::vmaf::run_vmaf(
+                &probe_name,
+                chunk.source_cmd.as_slice(),
+                self.vspipe_args.clone(),
+                &fl_path,
+                model,
+                &self.vmaf_res,
+                &self.vmaf_scaler,
+                self.probing_rate,
+                self.vmaf_filter.as_deref(),
+                self.vmaf_threads,
+                chunk.frame_rate,
+                disable_motion,
+            )?;
+        }
 
         Ok(fl_path)
     }
@@ -287,35 +375,75 @@ impl TargetQuality {
         &self,
         chunk: &mut Chunk,
         worker_id: Option<usize>,
-    ) -> Result<(), Box<EncoderCrash>> {
+    ) -> anyhow::Result<()> {
         chunk.tq_cq = Some(self.per_shot_target_quality(chunk, worker_id)?);
         Ok(())
     }
 }
 
-pub fn weighted_search(num1: f64, vmaf1: f64, num2: f64, vmaf2: f64, target: f64) -> usize {
-    let dif1 = (transform_vmaf(target) - transform_vmaf(vmaf2)).abs();
-    let dif2 = (transform_vmaf(target) - transform_vmaf(vmaf1)).abs();
+fn predict_quantizer(
+    lower_quantizer_limit: u32,
+    upper_quantizer_limit: u32,
+    quantizer_score_history: &[(u32, f64)],
+    target: f64,
+) -> u32 {
+    if quantizer_score_history.len() < 2 {
+        // Fewer than 2 probes, return the midpoint between the upper and lower
+        // quantizer bounds
+        return (lower_quantizer_limit + upper_quantizer_limit) / 2;
+    }
 
-    let tot = dif1 + dif2;
+    // Sort history by quantizer
+    let mut sorted_quantizer_score_history = quantizer_score_history.to_vec();
+    sorted_quantizer_score_history.sort_by_key(|(quantizer, _)| *quantizer);
+    let mut quantizer_score_map: Vec<(u32, f64)> = sorted_quantizer_score_history
+        .iter()
+        .map(|(quantizer, score)| (*quantizer, *score))
+        .collect();
+    quantizer_score_map.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    // Create interpolation keys from score-quantizer pairs
+    let (scores, quantizers): (Vec<f64>, Vec<f64>) = quantizer_score_map
+        .iter()
+        .map(|(quantizer, score)| (*score, *quantizer as f64))
+        .unzip();
+    let keys = scores
+        .iter()
+        .zip(quantizers.iter())
+        .map(|(score, quantizer)| {
+            Key::new(
+                *score,
+                *quantizer,
+                match sorted_quantizer_score_history.len() {
+                    0..=1 => unreachable!(),        // Handled in earlier guard
+                    2 => Interpolation::Linear,     // 2 probes, use Linear without fitting curve
+                    _ => Interpolation::CatmullRom, // 3 or more probes, fit CatmullRom curve
+                },
+            )
+        })
+        .collect();
 
-    num1.mul_add(dif1 / tot, num2 * (dif2 / tot)).round() as usize
-}
-
-pub fn transform_vmaf(vmaf: f64) -> f64 {
-    let x: f64 = 1.0 - vmaf / 100.0;
-    if vmaf < 99.99 {
-        -x.ln()
+    let spline = Spline::from_vec(keys);
+    if let Some(predicted_quantizer) = spline.sample(target) {
+        // Ensure predicted quantizer is an integer and within bounds
+        (predicted_quantizer.round() as u32).clamp(lower_quantizer_limit, upper_quantizer_limit)
     } else {
-        9.2
+        // We expect this to be unreachable but just in case
+        // Failed to predict quantizer from Spline interpolation
+        error!(
+            "Failed to predict quantizer from Spline interpolation with target: {target}
+            quantizer_score_history: {quantizer_score_history:?}",
+        );
+        (lower_quantizer_limit + upper_quantizer_limit) / 2
     }
 }
 
-/// Returns auto detected amount of threads used for vmaf calculation
+fn within_tolerance(score: f64, target: f64) -> bool {
+    (score - target).abs() / target < SCORE_TOLERANCE
+}
+
 pub fn vmaf_auto_threads(workers: usize) -> usize {
     const OVER_PROVISION_FACTOR: f64 = 1.25;
 
-    // Logical CPUs
     let threads = available_parallelism()
         .expect("Unrecoverable: Failed to get thread count")
         .get();
@@ -326,72 +454,49 @@ pub fn vmaf_auto_threads(workers: usize) -> usize {
     )
 }
 
-/// Use linear interpolation to get q/crf values closest to the target value
-pub fn interpolate_target_q(scores: Vec<(f64, u32)>, target: f64) -> Result<f64, Error> {
-    let mut sorted = scores;
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-    let keys = sorted
-        .iter()
-        .map(|(x, y)| Key::new(*x, f64::from(*y), Interpolation::Linear))
-        .collect();
-
-    let spline = Spline::from_vec(keys);
-
-    Ok(spline.sample(target).unwrap())
-}
-
-/// Use linear interpolation to get vmaf value that expected from q
-pub fn interpolate_target_vmaf(scores: Vec<(f64, u32)>, q: f64) -> Result<f64, Error> {
-    let mut sorted = scores;
-    sorted.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(Ordering::Less));
-
-    let keys = sorted
-        .iter()
-        .map(|f| Key::new(f64::from(f.1), f.0, Interpolation::Linear))
-        .collect();
-
-    let spline = Spline::from_vec(keys);
-
-    Ok(spline.sample(q).unwrap())
-}
-
 #[derive(Copy, Clone)]
-pub enum Skip {
-    High,
-    Low,
+pub enum SkipProbingReason {
+    QuantizerTooHigh,
+    QuantizerTooLow,
+    WithinTolerance,
+    ProbeLimitReached,
     None,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn log_probes(
-    vmaf_cq_scores: &mut [(f64, u32)],
+    quantizer_score_history: &mut [(u32, f64)],
+    target: f64,
     frames: u32,
     probing_rate: u32,
-    chunk_idx: &str,
-    target_q: u32,
-    target_vmaf: f64,
-    skip: Skip,
+    probing_speed: Option<u8>,
+    chunk_name: &str,
+    target_quantizer: u32,
+    target_score: f64,
+    skip: SkipProbingReason,
 ) {
-    vmaf_cq_scores.sort_by_key(|(_score, q)| *q);
+    // Sort history by quantizer
+    quantizer_score_history.sort_by_key(|(quantizer, _)| *quantizer);
 
-    // TODO: take chunk id as integer instead and format with {:05}
     debug!(
-        "chunk {}: P-Rate={}, {} frames",
-        chunk_idx, probing_rate, frames
-    );
-    debug!(
-        "chunk {}: TQ-Probes: {:.2?}{}",
-        chunk_idx,
-        vmaf_cq_scores,
-        match skip {
-            Skip::High => " Early Skip High Q",
-            Skip::Low => " Early Skip Low Q",
-            Skip::None => "",
-        }
-    );
-    debug!(
-        "chunk {}: Target Q={:.0}, VMAF={:.2}",
-        chunk_idx, target_q, target_vmaf
+        "chunk {name}: Target={target}, P-Rate={rate}, P-Speed={speed:?}, {frame_count} frames
+        TQ-Probes: {history:.2?}{suffix}
+        Final Q={target_quantizer:.0}, Final Score={target_score:.2}",
+        name = chunk_name,
+        target = target,
+        rate = probing_rate,
+        speed = ProbingSpeed::from_repr(probing_speed.unwrap_or(4) as usize),
+        frame_count = frames,
+        history = quantizer_score_history,
+        suffix = match skip {
+            SkipProbingReason::None => "",
+            SkipProbingReason::QuantizerTooHigh => "Early Skip High Quantizer",
+            SkipProbingReason::QuantizerTooLow => " Early Skip Low Quantizer",
+            SkipProbingReason::WithinTolerance => " Early Skip Within Tolerance",
+            SkipProbingReason::ProbeLimitReached => " Early Skip Probe Limit Reached",
+        },
+        target_quantizer = target_quantizer,
+        target_score = target_score
     );
 }
 
@@ -401,70 +506,4 @@ pub const fn adapt_probing_rate(rate: usize) -> usize {
         1..=4 => rate,
         _ => 1,
     }
-}
-
-pub fn interpolated_target_q(scores: Vec<(f64, u32)>, target: f64) -> (f64, f64) {
-    let q = interpolate_target_q(scores.clone(), target).unwrap();
-
-    let vmaf = interpolate_target_vmaf(scores, q).unwrap();
-
-    (q, vmaf)
-}
-
-#[allow(unused)]
-fn lagrange_interpolate(p: &[(u32, f64)], x: u32) -> f64 {
-    p.iter()
-        .map(|(x0, y0)| {
-            let mut num = 1;
-            let mut den = 1;
-            for (x1, _y1) in p {
-                if x0 != x1 {
-                    num *= i64::from(x) - i64::from(*x1);
-                    den *= i64::from(*x0) - i64::from(*x1);
-                }
-            }
-            y0 * num as f64 / den as f64
-        })
-        .sum()
-}
-
-#[allow(unused)]
-fn lagrange_bisect(p: &[(u32, f64)], y: f64) -> (u32, f64) {
-    assert!(p.len() >= 2);
-
-    // Re-center the samples at the target value
-    let mut sorted = Vec::from(p);
-    for v in &mut sorted {
-        v.1 -= y;
-    }
-
-    // Order samples by distance from target value
-    sorted.sort_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap());
-
-    // Take the closest point
-    let (mut xb, mut yb) = sorted[0];
-    // Take the next close point that brackets the root
-    let (mut xa, mut ya) = sorted.iter().find(|&&v| v.1 * yb < 0.).unwrap_or(&(xb, yb));
-
-    loop {
-        let x0 = (xa + xb).div_ceil(2);
-        if x0 == xb || x0 == xa {
-            break;
-        }
-
-        let y0 = lagrange_interpolate(&sorted, x0);
-        if ya * y0 < 0. {
-            xb = x0;
-            yb = y0;
-        } else {
-            xa = x0;
-            ya = y0;
-        }
-        if ya.abs() < yb.abs() {
-            std::mem::swap(&mut xa, &mut xb);
-            std::mem::swap(&mut ya, &mut yb);
-        }
-    }
-
-    (xb, yb + y)
 }
